@@ -42,6 +42,17 @@ ASPECT_RATIO_SIZES: dict[str, tuple[int, int]] = {
 }
 
 
+def count_cuda_devices(cuda_devices: str) -> int:
+    return len([device for device in cuda_devices.split(",") if device.strip()])
+
+
+def resolve_device_map(cuda_devices: str, device_map: str) -> str:
+    """Use full-GPU load for single-card setups; balanced is for 2+ GPUs."""
+    if count_cuda_devices(cuda_devices) < 2:
+        return "cuda"
+    return device_map
+
+
 @dataclass(frozen=True)
 class ServiceConfig:
     model_path: str = field(
@@ -89,6 +100,9 @@ class ServiceConfig:
             raise ValueError("T2I_PORT must be between 1 and 65535")
         if self.device_map not in {"balanced", "cuda"}:
             raise ValueError('T2I_DEVICE_MAP must be "balanced" or "cuda"')
+
+    def resolved_device_map(self) -> str:
+        return resolve_device_map(self.cuda_devices, self.device_map)
 
 
 def parse_size(size: str | None, aspect_ratio: str | None, default_width: int, default_height: int) -> tuple[int, int]:

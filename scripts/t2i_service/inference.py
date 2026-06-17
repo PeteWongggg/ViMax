@@ -35,6 +35,7 @@ class QwenImageEditWorker:
     def __init__(self, config: ServiceConfig) -> None:
         self.config = config
         self._pipe: QwenImageEditPlusPipeline | None = None
+        self._torch_device = torch.device("cpu")
         self._lock = threading.Lock()
         self._loaded = False
         self._load_error: str | None = None
@@ -52,25 +53,32 @@ class QwenImageEditWorker:
             if self._loaded or self._load_error:
                 return
             os.environ["CUDA_VISIBLE_DEVICES"] = self.config.cuda_devices
+            device_map = self.config.resolved_device_map()
             started = time.perf_counter()
             logger.info(
-                "Loading QwenImageEditPlusPipeline from %s | cuda_devices=%s device_map=%s",
+                "Loading QwenImageEditPlusPipeline from %s | cuda_devices=%s device_map=%s (requested=%s)",
                 self.config.model_path,
                 self.config.cuda_devices,
+                device_map,
                 self.config.device_map,
             )
             try:
                 load_kwargs: dict[str, Any] = {
                     "torch_dtype": torch.bfloat16,
                 }
-                if self.config.device_map == "balanced":
+                if device_map == "balanced":
                     load_kwargs["device_map"] = "balanced"
                 self._pipe = QwenImageEditPlusPipeline.from_pretrained(
                     self.config.model_path,
                     **load_kwargs,
                 )
-                if self.config.device_map == "cuda":
+                if device_map == "cuda":
+                    if not torch.cuda.is_available():
+                        raise RuntimeError("CUDA is not available after setting CUDA_VISIBLE_DEVICES")
                     self._pipe.to("cuda")
+                    self._torch_device = torch.device("cuda:0")
+                else:
+                    self._torch_device = torch.device("cuda:0")
                 self._pipe.set_progress_bar_config(disable=None)
                 self._loaded = True
                 elapsed = int((time.perf_counter() - started) * 1000)
@@ -126,7 +134,7 @@ class QwenImageEditWorker:
 
         generator = None
         if seed is not None:
-            generator = torch.Generator(device="cuda:0").manual_seed(seed)
+            generator = torch.Generator(device=self._torch_device).manual_seed(seed)
 
         inputs: dict[str, Any] = {
             "image": reference_images,
