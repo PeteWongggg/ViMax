@@ -1,0 +1,12 @@
+# GPU text-to-image service dependencies.
+# Install in the same Python env that has CUDA + your Qwen-Image model deps.
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.10.0
+torch>=2.5.0
+diffusers>=0.32.0
+transformers>=4.48.0
+accelerate>=1.2.0
+pillow>=11.0.0
+safetensors>=0.5.0
