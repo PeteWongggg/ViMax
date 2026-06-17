@@ -1,4 +1,4 @@
-"""Quick client for local T2I service smoke tests."""
+"""Quick client for local image-edit service smoke tests."""
 
 from __future__ import annotations
 
@@ -8,21 +8,38 @@ import json
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Smoke test for local T2I service")
+    parser = argparse.ArgumentParser(description="Smoke test for local image-edit service")
     parser.add_argument("--base-url", default="http://127.0.0.1:8100")
-    parser.add_argument("--prompt", default="一个成年人")
+    parser.add_argument(
+        "--prompt",
+        default=(
+            "The magician bear is on the left, the alchemist bear is on the right, "
+            "facing each other in the central park square."
+        ),
+    )
     parser.add_argument("--output", default="service_test.png")
-    parser.add_argument("--size", default="1664x928")
+    parser.add_argument("--reference-image", action="append", default=[], dest="reference_images")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--steps", type=int, default=40)
+    parser.add_argument("--true-cfg-scale", type=float, default=4.0)
+    parser.add_argument("--guidance-scale", type=float, default=1.0)
     args = parser.parse_args()
 
     payload = {
         "prompt": args.prompt,
-        "size": args.size,
         "seed": args.seed,
+        "num_inference_steps": args.steps,
+        "true_cfg_scale": args.true_cfg_scale,
+        "guidance_scale": args.guidance_scale,
+        "negative_prompt": " ",
+        "reference_images_b64": [
+            base64.b64encode(Path(path).read_bytes()).decode("ascii")
+            for path in args.reference_images
+        ],
     }
     url = f"{args.base_url.rstrip('/')}/v1/images/generations"
     request = urllib.request.Request(

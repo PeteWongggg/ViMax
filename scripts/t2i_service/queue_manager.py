@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import ServiceConfig
-from .inference import QwenImageWorker, image_to_b64, summarize_request
+from .inference import QwenImageEditWorker, image_to_b64, summarize_request
 from .schemas import GenerateRequest, GenerateResponse, JobStatusResponse
 
 logger = logging.getLogger("t2i_service.queue")
@@ -143,6 +143,7 @@ class InferenceQueue:
                 height=inference_result.height,
                 format=self.config.output_format,
                 seed=inference_result.seed,
+                reference_image_count=inference_result.reference_image_count,
                 queue_wait_ms=job.queue_wait_ms,
                 inference_ms=inference_result.inference_ms,
                 total_ms=total_ms,

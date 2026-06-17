@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
 from .config import load_config
-from .inference import QwenImageWorker
+from .inference import QwenImageEditWorker
 from .logging_setup import setup_logging
 from .queue_manager import InferenceQueue
 from .schemas import GenerateRequest, GenerateResponse, HealthResponse, JobStatusResponse, QueueStatsResponse
@@ -18,18 +18,19 @@ logger = logging.getLogger("t2i_service.server")
 
 config = load_config()
 setup_logging(config.log_dir, config.log_level)
-worker = QwenImageWorker(config)
+worker = QwenImageEditWorker(config)
 queue = InferenceQueue(config, worker)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     logger.info(
-        "Starting T2I service | host=%s port=%d model=%s cuda=%s",
+        "Starting image-edit service | host=%s port=%d model=%s cuda=%s device_map=%s",
         config.host,
         config.port,
         config.model_path,
         config.cuda_devices,
+        config.device_map,
     )
     loop = asyncio.get_running_loop()
     try:
@@ -39,13 +40,16 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     await queue.start()
     yield
     await queue.stop()
-    logger.info("T2I service stopped")
+    logger.info("Image-edit service stopped")
 
 
 app = FastAPI(
-    title="ViMax Local T2I Service",
-    version="0.1.0",
-    description="Queued local GPU text-to-image service for Qwen-Image and future ViMax adapters.",
+    title="ViMax Local Image Edit Service",
+    version="0.2.0",
+    description=(
+        "Queued local GPU image-edit service backed by Qwen-Image-Edit-2511 "
+        "for ViMax adapters."
+    ),
     lifespan=lifespan,
 )
 
@@ -59,6 +63,8 @@ async def health() -> HealthResponse:
     return HealthResponse(
         status=status,  # type: ignore[arg-type]
         model_loaded=worker.is_loaded,
+        pipeline="QwenImageEditPlusPipeline",
+        device_map=config.device_map,
         queue_size=stats["queue_size"],
         active_job_id=stats["active_job_id"],
         cuda_devices=config.cuda_devices,
@@ -82,7 +88,7 @@ async def get_job(job_id: str) -> JobStatusResponse:
 
 @app.post("/v1/images/generations", response_model=GenerateResponse)
 async def generate_image(request: GenerateRequest) -> GenerateResponse:
-    """Synchronous-style endpoint: enqueue, wait for GPU slot, return image."""
+    """Enqueue an image-edit job, wait for GPU slot, return edited image."""
     try:
         job = await queue.submit(request)
     except RuntimeError as exc:

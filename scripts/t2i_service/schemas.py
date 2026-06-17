@@ -6,18 +6,29 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class GenerateRequest(BaseModel):
-    prompt: str = Field(..., min_length=1, description="Positive prompt for image generation.")
+    prompt: str = Field(..., min_length=1, description="Edit/generation prompt.")
     negative_prompt: str | None = Field(default=None, description="Negative prompt.")
-    width: int | None = Field(default=None, ge=256, le=4096)
-    height: int | None = Field(default=None, ge=256, le=4096)
-    size: str | None = Field(default=None, description='ViMax-style size, e.g. "1600x900".')
-    aspect_ratio: str | None = Field(default=None, description='Aspect ratio, e.g. "16:9".')
+    width: int | None = Field(
+        default=None,
+        ge=256,
+        le=4096,
+        description="Hint for blank fallback canvas when no reference images are provided.",
+    )
+    height: int | None = Field(
+        default=None,
+        ge=256,
+        le=4096,
+        description="Hint for blank fallback canvas when no reference images are provided.",
+    )
+    size: str | None = Field(default=None, description='ViMax-style size hint, e.g. "1600x900".')
+    aspect_ratio: str | None = Field(default=None, description='Aspect ratio hint, e.g. "16:9".')
     num_inference_steps: int | None = Field(default=None, ge=1, le=150)
     true_cfg_scale: float | None = Field(default=None, ge=0.0, le=20.0)
+    guidance_scale: float | None = Field(default=None, ge=0.0, le=20.0)
     seed: int | None = Field(default=None, ge=0)
     reference_images_b64: list[str] = Field(
         default_factory=list,
-        description="Optional reference images as base64 PNG/JPEG. Currently logged and ignored by Qwen-Image.",
+        description="Reference images as base64 PNG/JPEG. Passed to Qwen-Image-Edit as `image=[...]`.",
     )
     response_format: Literal["b64_json", "url"] = "b64_json"
     metadata: dict[str, Any] = Field(default_factory=dict, description="Opaque metadata echoed in response.")
@@ -39,6 +50,7 @@ class GenerateResponse(BaseModel):
     height: int
     format: str
     seed: int | None
+    reference_image_count: int
     queue_wait_ms: int
     inference_ms: int
     total_ms: int
@@ -59,6 +71,8 @@ class JobStatusResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: Literal["ok", "loading", "error"]
     model_loaded: bool
+    pipeline: str
+    device_map: str
     queue_size: int
     active_job_id: str | None
     cuda_devices: str
