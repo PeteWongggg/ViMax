@@ -64,7 +64,7 @@ async def health() -> HealthResponse:
         status=status,  # type: ignore[arg-type]
         model_loaded=worker.is_loaded,
         pipeline="QwenImageEditPlusPipeline",
-        device_map=config.device_map,
+        device_map=config.resolved_device_map(),
         queue_size=stats["queue_size"],
         active_job_id=stats["active_job_id"],
         cuda_devices=config.cuda_devices,
