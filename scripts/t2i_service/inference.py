@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import gc
 import io
 import logging
 import os
@@ -160,9 +161,15 @@ class QwenImageEditWorker:
         )
 
         with self._lock:
-            with torch.inference_mode():
-                output = self._pipe(**inputs)
-            image = output.images[0]
+            try:
+                with torch.inference_mode():
+                    output = self._pipe(**inputs)
+                image = output.images[0]
+            finally:
+                del inputs
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         inference_ms = int((time.perf_counter() - started) * 1000)
         logger.info(
