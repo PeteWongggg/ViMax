@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from .config import load_config
 from .inference import QwenImageEditWorker
 from .logging_setup import setup_logging
+from .runtime import install_runtime_hooks
 from .queue_manager import InferenceQueue
 from .schemas import GenerateRequest, GenerateResponse, HealthResponse, JobStatusResponse, QueueStatsResponse
 
@@ -18,6 +19,7 @@ logger = logging.getLogger("t2i_service.server")
 
 config = load_config()
 setup_logging(config.log_dir, config.log_level)
+install_runtime_hooks()
 worker = QwenImageEditWorker(config)
 queue = InferenceQueue(config, worker)
 
@@ -89,6 +91,7 @@ async def get_job(job_id: str) -> JobStatusResponse:
 @app.post("/v1/images/generations", response_model=GenerateResponse)
 async def generate_image(request: GenerateRequest) -> GenerateResponse:
     """Enqueue an image-edit job, wait for GPU slot, return edited image."""
+    job = None
     try:
         job = await queue.submit(request)
     except RuntimeError as exc:
@@ -100,6 +103,9 @@ async def generate_image(request: GenerateRequest) -> GenerateResponse:
         raise HTTPException(status_code=504, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        if job is not None:
+            queue.release_job_image(job.job_id)
 
 
 @app.post("/v1/images/generations/async", response_model=JobStatusResponse)

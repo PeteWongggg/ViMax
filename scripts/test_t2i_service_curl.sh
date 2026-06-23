@@ -50,7 +50,7 @@ PY
 HTTP_CODE="$(
   curl -sS --max-time 600 \
     -H "Content-Type: application/json" \
-    -X POST "http://127.0.0.1:8100/v1/images/generations" \
+    -X POST "http://118.196.65.175:8911/v1/images/generations" \
     -d "$PAYLOAD" \
     -o "$RESPONSE_FILE" \
     -w "%{http_code}"

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
@@ -31,11 +32,12 @@ class QueueJob:
 
 
 class InferenceQueue:
-    def __init__(self, config: ServiceConfig, worker: QwenImageWorker) -> None:
+    def __init__(self, config: ServiceConfig, worker: QwenImageEditWorker) -> None:
         self.config = config
         self.worker = worker
         self._queue: asyncio.Queue[QueueJob | None] | None = None
         self._jobs: dict[str, QueueJob] = {}
+        self._finished_job_ids: deque[str] = deque()
         self._active_job_id: str | None = None
         self._completed_jobs = 0
         self._failed_jobs = 0
@@ -47,7 +49,11 @@ class InferenceQueue:
             return
         self._queue = asyncio.Queue(maxsize=self.config.max_queue_size)
         self._consumer_task = asyncio.create_task(self._consume(), name="t2i-queue-consumer")
-        logger.info("Queue started | max_size=%d", self.config.max_queue_size)
+        logger.info(
+            "Queue started | max_size=%d job_retention=%d",
+            self.config.max_queue_size,
+            self.config.job_retention_count,
+        )
 
     async def stop(self) -> None:
         if self._queue is not None:
@@ -55,6 +61,8 @@ class InferenceQueue:
         if self._consumer_task is not None:
             await self._consumer_task
         self._executor.shutdown(wait=True, cancel_futures=False)
+        self._jobs.clear()
+        self._finished_job_ids.clear()
         logger.info("Queue stopped")
 
     async def submit(self, request: GenerateRequest) -> QueueJob:
@@ -76,6 +84,13 @@ class InferenceQueue:
             return await asyncio.wait_for(job.future, timeout=timeout_seconds)
         except asyncio.TimeoutError as exc:
             raise RuntimeError(f"Request timed out after {timeout_seconds:.0f}s") from exc
+
+    def release_job_image(self, job_id: str) -> None:
+        """Drop large base64 payload after the HTTP response has been sent."""
+        job = self._jobs.get(job_id)
+        if job is None or job.result is None:
+            return
+        job.result = job.result.model_copy(update={"image_b64": ""})
 
     def get_job(self, job_id: str) -> QueueJob | None:
         return self._jobs.get(job_id)
@@ -104,6 +119,18 @@ class InferenceQueue:
             error=job.error,
             result=job.result,
         )
+
+    def _mark_finished(self, job_id: str) -> None:
+        self._finished_job_ids.append(job_id)
+        self._prune_finished_jobs()
+
+    def _prune_finished_jobs(self) -> None:
+        while len(self._finished_job_ids) > self.config.job_retention_count:
+            old_job_id = self._finished_job_ids.popleft()
+            if old_job_id == self._active_job_id:
+                continue
+            if self._jobs.pop(old_job_id, None) is not None:
+                logger.debug("Pruned finished job %s from memory", old_job_id)
 
     async def _consume(self) -> None:
         assert self._queue is not None
@@ -162,6 +189,7 @@ class InferenceQueue:
             )
             if not job.future.done():
                 job.future.set_result(response)
+            self._mark_finished(job.job_id)
         except Exception as exc:
             job.status = "failed"
             job.error = str(exc)
@@ -170,5 +198,6 @@ class InferenceQueue:
             request_logger.exception("failed | job_id=%s | error=%s", job.job_id, exc)
             if not job.future.done():
                 job.future.set_exception(exc)
+            self._mark_finished(job.job_id)
         finally:
             self._active_job_id = None

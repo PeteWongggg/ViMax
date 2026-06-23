@@ -67,6 +67,7 @@ class ServiceConfig:
     port: int = field(default_factory=lambda: _env_int("T2I_PORT", 8100))
     max_queue_size: int = field(default_factory=lambda: _env_int("T2I_MAX_QUEUE_SIZE", 32))
     max_reference_images: int = field(default_factory=lambda: _env_int("T2I_MAX_REFERENCE_IMAGES", 8))
+    job_retention_count: int = field(default_factory=lambda: _env_int("T2I_JOB_RETENTION_COUNT", 64))
     request_timeout_seconds: float = field(
         default_factory=lambda: _env_float("T2I_REQUEST_TIMEOUT_SECONDS", 600.0)
     )
@@ -96,6 +97,8 @@ class ServiceConfig:
             raise ValueError("T2I_MAX_QUEUE_SIZE must be >= 1")
         if self.max_reference_images < 1:
             raise ValueError("T2I_MAX_REFERENCE_IMAGES must be >= 1")
+        if self.job_retention_count < 1:
+            raise ValueError("T2I_JOB_RETENTION_COUNT must be >= 1")
         if self.port < 1 or self.port > 65535:
             raise ValueError("T2I_PORT must be between 1 and 65535")
         if self.device_map not in {"balanced", "cuda"}:
