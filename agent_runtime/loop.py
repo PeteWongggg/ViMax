@@ -70,12 +70,10 @@ class AgentLoop:
             try:
                 assistant = await self.llm.complete(runtime_messages, tools=tool_schemas)
             except Exception as exc:
-                # Without this boundary a single API failure propagated out of the
-                # generator: the turn record was never persisted and the CLI died.
                 status = "failed"
-                final_text = f"LLM call failed: {exc}"
-                transitions.append(_transition("sampling_assistant", "finalizing_answer", "llm_error"))
-                yield {"type": "error", "turn_id": control.turn_id, "message": final_text}
+                final_text = f"Agent LLM request failed: {exc}"
+                transitions.append(_transition("sampling_assistant", "finalizing_answer", "llm_sampling_failed"))
+                yield {"type": "error", "turn_id": control.turn_id, "message": final_text, "metadata": {"error_type": "llm_sampling_failed"}}
                 break
             assistant_turns.append({"phase": "initial" if tool_round == 0 else f"followup_{tool_round}", "text": assistant.text, "tool_calls": [call.as_dict() for call in assistant.tool_calls]})
             if not assistant.tool_calls:
@@ -95,6 +93,7 @@ class AgentLoop:
             yield {"type": "status", "turn_id": control.turn_id, "phase": "executing_tools", "message": f"Running tools (round {tool_round})"}
             runtime_messages.append({"role": "assistant", "content": assistant.text or "", "tool_calls": [_openai_tool_call(call) for call in assistant.tool_calls]})
             round_results: list[ToolResult] = []
+            round_model_content: list[dict[str, Any]] = []
 
             for call in assistant.tool_calls:
                 yield {"type": "tool_start", "turn_id": control.turn_id, "tool": call.as_dict()}
@@ -117,6 +116,21 @@ class AgentLoop:
                 all_tool_results.append(result)
                 yield {"type": "tool_result", "turn_id": control.turn_id, "tool_result": result.as_dict()}
                 runtime_messages.append({"role": "tool", "tool_call_id": call.id, "name": result.name, "content": json.dumps(result.as_dict(), ensure_ascii=False)})
+                if result.model_content:
+                    round_model_content.extend(result.model_content)
+            if round_model_content:
+                runtime_messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Tool-provided image observation(s). Inspect these pixels as evidence for the active task; this is not a new user request.",
+                            },
+                            *round_model_content,
+                        ],
+                    }
+                )
             tool_rounds.append({"tool_round": tool_round, "requested_tools": [call.as_dict() for call in assistant.tool_calls], "tool_results": [result.as_dict() for result in round_results]})
             transitions.append(_transition("executing_tools", "post_tool_decision", "tool_round_completed"))
             transitions.append(_transition("post_tool_decision", "sampling_assistant", "runtime_continuation_after_tools"))

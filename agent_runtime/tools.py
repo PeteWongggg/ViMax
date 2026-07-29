@@ -11,6 +11,7 @@ from pathlib import Path
 from threading import Event
 from typing import Any, Awaitable, Callable
 
+from .image_tools import ViewImageHandler
 from .models import ToolCall, ToolResult
 
 ToolHandler = Callable[..., Awaitable[ToolResult] | ToolResult]
@@ -186,6 +187,7 @@ def _type_to_json_schema(tp: type | tuple[type, ...]) -> dict[str, Any]:
 
 def build_builtin_registry(workspace_root: str | Path, session_index: Any, adapter_specs: list[ToolSpec] | None = None) -> ToolRegistry:
     root = Path(workspace_root).resolve()
+    view_image = ViewImageHandler(root, session_index)
 
     def safe_path(raw: Any) -> Path:
         path = (root / str(raw)).resolve()
@@ -193,15 +195,73 @@ def build_builtin_registry(workspace_root: str | Path, session_index: Any, adapt
             raise ValueError(f"Path escapes workspace: {raw}")
         return path
 
+    def _legacy_virtual_read(raw_path: Any, *, as_json: bool) -> ToolResult | None:
+        """Compatibility for paths older prompts/models may hallucinate.
+
+        The authoritative session state is .vimax/sessions.json and logs are
+        .vimax/logs/*.jsonl, but some model turns ask for per-session files like
+        .working_dir/<session>/session.json or .vimax/logs/<session>.log.
+        """
+        path = safe_path(raw_path)
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            return None
+        parts = rel.parts
+        if len(parts) == 3 and parts[0] == ".working_dir" and parts[2] == "session.json":
+            session_id = parts[1]
+            record = session_index.get(session_id)
+            if record is None:
+                return None
+            payload = {
+                "session": record,
+                "artifact_checklist": session_index.artifact_checklist(session_id),
+                "source": ".vimax/sessions.json",
+                "virtual_path": rel.as_posix(),
+            }
+            content = json.dumps(payload, ensure_ascii=False, indent=2)
+            return ToolResult("read_json" if as_json else "read_file", True, content, {"virtual_path": True, "source": ".vimax/sessions.json"})
+        if len(parts) == 3 and parts[0] == ".vimax" and parts[1] == "logs" and parts[2].endswith(".log"):
+            session_id = parts[2][:-4]
+            rows: list[dict[str, Any]] = []
+            for log_name in ("loop_history", "tool_calls", "revisions"):
+                log_path = session_index.logs_dir / f"{log_name}.jsonl"
+                if not log_path.exists():
+                    continue
+                for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    if session_id not in line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        item = {"raw": line}
+                    item["_log"] = log_name
+                    rows.append(item)
+            payload = {
+                "session_id": session_id,
+                "source": ".vimax/logs/*.jsonl",
+                "virtual_path": rel.as_posix(),
+                "records": rows,
+            }
+            content = json.dumps(payload, ensure_ascii=False, indent=2)
+            return ToolResult("read_json" if as_json else "read_file", True, content, {"virtual_path": True, "source": ".vimax/logs/*.jsonl", "record_count": len(rows)})
+        return None
+
     def read_file(args: dict[str, Any]) -> ToolResult:
         path = safe_path(args["path"])
         if not path.exists():
+            virtual = _legacy_virtual_read(args["path"], as_json=False)
+            if virtual is not None:
+                return virtual
             return ToolResult("read_file", False, f"File not found: {path}")
         return ToolResult("read_file", True, path.read_text(encoding="utf-8"))
 
     def read_json(args: dict[str, Any]) -> ToolResult:
         path = safe_path(args["path"])
         if not path.exists():
+            virtual = _legacy_virtual_read(args["path"], as_json=True)
+            if virtual is not None:
+                return virtual
             return ToolResult("read_json", False, f"File not found: {path}")
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -328,12 +388,13 @@ def build_builtin_registry(workspace_root: str | Path, session_index: Any, adapt
         return ToolResult("run_shell", proc.returncode == 0, content, {"returncode": proc.returncode, "truncated": truncated})
 
     specs = [
-        ToolSpec("read_file", "Read a UTF-8 text file inside the workspace.", read_file, schema={"path": ToolArgumentSchema(str, True)}, concurrency_safe=True),
-        ToolSpec("read_json", "Read and parse a JSON file inside the workspace.", read_json, schema={"path": ToolArgumentSchema(str, True)}, concurrency_safe=True),
+        ToolSpec("read_file", "Read a UTF-8 text file inside the workspace. Also resolves virtual legacy session paths like .vimax/logs/<session>.log.", read_file, schema={"path": ToolArgumentSchema(str, True)}, concurrency_safe=True),
+        ToolSpec("read_json", "Read and parse a JSON file inside the workspace. Also resolves virtual legacy session paths like .working_dir/<session>/session.json.", read_json, schema={"path": ToolArgumentSchema(str, True)}, concurrency_safe=True),
         ToolSpec("write_json", "Write formatted JSON inside the workspace.", write_json, schema={"path": ToolArgumentSchema(str, True), "data": ToolArgumentSchema((dict, list), True)}),
         ToolSpec("list_files", "List direct children of a workspace path.", list_files, schema={"path": ToolArgumentSchema(str, False, ".")}, concurrency_safe=True),
         ToolSpec("glob_files", "Find workspace files with a glob pattern.", glob_files, schema={"pattern": ToolArgumentSchema(str, True)}, concurrency_safe=True),
         ToolSpec("search_text", "Search text in workspace files.", search_text, schema={"query": ToolArgumentSchema(str, True), "path": ToolArgumentSchema(str, False, "."), "max_results": ToolArgumentSchema(int, False, 100)}, concurrency_safe=True),
+        ToolSpec("view_image", "Load a PNG, JPEG, WebP, or GIF from the active session and present its pixels to the multimodal model. Accepts a session-relative path or a path prefixed by the active .working_dir session.", view_image, permission_mode="read-only", schema={"path": ToolArgumentSchema(str, True)}, concurrency_safe=True),
         ToolSpec("memory_read", "Read .vimax/memory.md user preferences.", memory_read, schema={}, concurrency_safe=True),
         ToolSpec("memory_write", "Replace .vimax/memory.md with user preference notes only.", memory_write, schema={"content": ToolArgumentSchema(str, True)}),
         ToolSpec("todo_read", "Read short-term todo items from .vimax/todo.json. This is not a task or team system.", todo_read, schema={}, concurrency_safe=True),

@@ -23,6 +23,9 @@ class ToolResult:
     ok: bool
     content: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Transient multimodal blocks for the next LLM turn. Deliberately omitted
+    # from as_dict() so image bytes never enter JSONL logs or session history.
+    model_content: list[dict[str, Any]] | None = field(default=None, repr=False)
 
     def as_dict(self) -> dict[str, Any]:
         return {"name": self.name, "ok": self.ok, "content": self.content, "metadata": dict(self.metadata)}

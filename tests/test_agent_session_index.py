@@ -6,6 +6,13 @@ from agent_runtime.session_index import SessionIndex
 
 
 class SessionIndexTests(unittest.TestCase):
+    def test_generated_session_id_round_trips_after_slug_truncation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            record = index.create(idea="A red ball rolls across a white table.")
+            self.assertIsNotNone(index.get(record["session_id"]))
+            self.assertEqual(index.working_dir(record["session_id"]).name, record["session_id"])
+
     def test_create_session_and_checklist(self):
         with tempfile.TemporaryDirectory() as tmp:
             index = SessionIndex(tmp)
@@ -19,6 +26,14 @@ class SessionIndexTests(unittest.TestCase):
             self.assertFalse(checklist["idea2video/scene_*/storyboard.json"])
             self.assertEqual(record["compacted_summary"], "")
             self.assertEqual(record["compaction_snapshots"], [])
+
+    def test_create_session_preserves_project_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            record = index.create(project_name="Ocean campaign")
+            self.assertEqual(record["project_name"], "Ocean campaign")
+            self.assertIn("ocean-campaign", record["session_id"])
+            self.assertEqual(index.get(record["session_id"])["project_name"], "Ocean campaign")
 
 
     def test_session_id_is_sanitized_and_stays_under_working_dir(self):

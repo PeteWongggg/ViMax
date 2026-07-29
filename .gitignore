@@ -13,10 +13,21 @@ wheels/
 .working_dir/
 .vimax/
 .test/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
 # Node dependencies
 node_modules/
 
 # Local agent secrets
 configs/*.local.json
 configs/*.local.yaml
-!configs/agent.local.yaml
+
+# Internal planning and local instructions
+AGENTS.md
+project_plan/
+project_working/
+user_idea/

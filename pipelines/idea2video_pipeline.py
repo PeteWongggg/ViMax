@@ -1,4 +1,5 @@
 import os
+import shutil
 import logging
 from agents import Screenwriter, CharacterExtractor, CharacterPortraitsGenerator
 from pipelines.script2video_pipeline import Script2VideoPipeline
@@ -96,6 +97,11 @@ class Idea2VideoPipeline:
             self.generate_portraits_for_single_character(character, style)
             for character in characters
             if character.identifier_in_scene not in character_portraits_registry
+            # Characters never shown on screen (e.g. a voice or chat-only
+            # character) have no physical description, so asking the image
+            # model for front/side/back portraits of them is nonsensical and
+            # fails repeatedly (finish_reason=IMAGE_OTHER, empty candidates).
+            and character.is_visible
         ]
         if tasks:
             for future in asyncio.as_completed(tasks):
@@ -171,15 +177,28 @@ class Idea2VideoPipeline:
         if os.path.exists(side_portrait_path):
             pass
         else:
-            side_portrait_output = await self.character_portraits_generator.generate_side_portrait(character, front_portrait_path)
-            side_portrait_output.save(side_portrait_path)
+            try:
+                side_portrait_output = await self.character_portraits_generator.generate_side_portrait(character, front_portrait_path)
+                side_portrait_output.save(side_portrait_path)
+            except Exception as e:
+                # gemini-2.5-flash-image intermittently (sometimes beyond
+                # the tenacity retry budget) fails this front->side
+                # re-angling edit with finish_reason=IMAGE_OTHER / empty
+                # content. Fall back to the front portrait rather than
+                # aborting the whole pipeline.
+                print(f"⚠️ Side portrait generation failed for {character.identifier_in_scene} after retries ({e}); reusing front portrait as fallback.")
+                shutil.copy(front_portrait_path, side_portrait_path)
 
         back_portrait_path = os.path.join(character_dir, "back.png")
         if os.path.exists(back_portrait_path):
             pass
         else:
-            back_portrait_output = await self.character_portraits_generator.generate_back_portrait(character, front_portrait_path)
-            back_portrait_output.save(back_portrait_path)
+            try:
+                back_portrait_output = await self.character_portraits_generator.generate_back_portrait(character, front_portrait_path)
+                back_portrait_output.save(back_portrait_path)
+            except Exception as e:
+                print(f"⚠️ Back portrait generation failed for {character.identifier_in_scene} after retries ({e}); reusing front portrait as fallback.")
+                shutil.copy(front_portrait_path, back_portrait_path)
 
         print(
             f"☑️ Completed character portrait generation for {character.identifier_in_scene}.")

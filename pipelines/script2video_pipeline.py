@@ -4,7 +4,8 @@ import json
 import logging
 import asyncio
 import time
-from typing import Any, Callable, Optional, Dict, List, Tuple, Literal
+from typing import Any, Callable, Optional, Dict, List, Tuple, Literal, Type, TypeVar
+from moviepy import VideoFileClip, concatenate_videoclips
 from PIL import Image
 from agents import *
 import yaml
@@ -12,8 +13,42 @@ from interfaces import *
 from langchain.chat_models import init_chat_model
 from tools.render_backend import RenderBackend
 from utils.provider_presets import resolve_chat_model_config
-from utils.text import safe_path_component
-from utils.video import concatenate_video_files
+
+
+
+
+TModel = TypeVar("TModel")
+
+
+def _normalize_model_list(items: Any, model_cls: Type[TModel], field_name: str) -> List[TModel]:
+    if items is None:
+        return []
+    if not isinstance(items, list):
+        raise TypeError(f"{field_name} must be a list, got {type(items).__name__}")
+    normalized: List[TModel] = []
+    for idx, item in enumerate(items):
+        if isinstance(item, model_cls):
+            normalized.append(item)
+        elif isinstance(item, dict):
+            normalized.append(model_cls.model_validate(item))
+        else:
+            raise TypeError(f"{field_name}[{idx}] must be {model_cls.__name__} or dict, got {type(item).__name__}")
+    return normalized
+
+
+def _group_shots_into_cameras(shot_descriptions: List[ShotDescription]) -> List[Camera]:
+    cameras_by_idx: Dict[int, Camera] = {}
+    for shot_description in shot_descriptions:
+        camera = cameras_by_idx.get(shot_description.cam_idx)
+        if camera is None:
+            camera = Camera(idx=shot_description.cam_idx, active_shot_idxs=[])
+            cameras_by_idx[shot_description.cam_idx] = camera
+        camera.active_shot_idxs.append(shot_description.idx)
+    return list(cameras_by_idx.values())
+
+def _collect_priority_shot_idxs(camera_tree: List[Camera]) -> List[int]:
+    """Shot indices that other cameras depend on."""
+    return [camera.parent_shot_idx for camera in camera_tree if camera.parent_shot_idx is not None]
 
 
 def _pipeline_print(quiet: bool, message: str) -> None:
@@ -52,12 +87,6 @@ class Script2VideoPipeline:
         video_generator,
         working_dir: str,
     ):
-        # Per-instance coordination events; these were once class attributes,
-        # which leaked shot/frame state across scenes when one pipeline object
-        # (or several) rendered more than one scene.
-        self.character_portrait_events = {}
-        self.shot_desc_events = {}
-        self.frame_events = {}
 
         self.chat_model = chat_model
         self.image_generator = image_generator
@@ -71,6 +100,9 @@ class Script2VideoPipeline:
 
         self.working_dir = working_dir
         os.makedirs(self.working_dir, exist_ok=True)
+        self.character_portrait_events = {}
+        self.shot_desc_events = {}
+        self.frame_events = {}
 
 
     async def plan_text_artifacts(
@@ -96,6 +128,7 @@ class Script2VideoPipeline:
             _emit_text_plan_progress(progress, "extract_characters", "Extracting characters from script")
             characters = await self.extract_characters(script=script, quiet=quiet)
         else:
+            characters = _normalize_model_list(characters, CharacterInScene, "characters")
             _emit_text_plan_progress(progress, "extract_characters", "Using provided characters", {"provided": True, "count": len(characters)})
             characters_path = os.path.join(self.working_dir, "characters.json")
             if not os.path.exists(characters_path):
@@ -117,11 +150,24 @@ class Script2VideoPipeline:
             characters=characters,
             quiet=quiet,
         )
-        _emit_text_plan_progress(progress, "construct_camera_tree", "Constructing camera tree", {"shot_count": len(shot_descriptions)})
-        camera_tree = await self.construct_camera_tree(
-            shot_descriptions=shot_descriptions,
-            quiet=quiet,
-        )
+        camera_tree = None
+        for attempt in range(2):
+            try:
+                stage = "construct_camera_tree" if attempt == 0 else "construct_camera_tree_retry"
+                message = "Constructing camera tree" if attempt == 0 else "Retrying camera tree construction after schema/type failure"
+                _emit_text_plan_progress(progress, stage, message, {"shot_count": len(shot_descriptions), "attempt": attempt + 1})
+                camera_tree = await self.construct_camera_tree(
+                    shot_descriptions=shot_descriptions,
+                    quiet=quiet,
+                )
+                break
+            except Exception:
+                camera_tree_path = os.path.join(self.working_dir, "camera_tree.json")
+                if os.path.exists(camera_tree_path):
+                    os.remove(camera_tree_path)
+                if attempt == 1:
+                    raise
+        assert camera_tree is not None
         return {
             "characters": characters,
             "storyboard": storyboard,
@@ -157,9 +203,6 @@ class Script2VideoPipeline:
         progress: Callable[[str, str, Dict[str, Any] | None], None] | None = None,
     ):
         _emit_render_progress(progress, "render_start", "Starting script2video render")
-        self.character_portrait_events = {}
-        self.shot_desc_events = {}
-        self.frame_events = {}
         if characters is None:
             _emit_render_progress(progress, "extract_characters", "Extracting characters before render")
             characters = await self.extract_characters(script=script, quiet=quiet)
@@ -176,6 +219,7 @@ class Script2VideoPipeline:
             #         json.dump([c.model_dump() for c in characters], f, ensure_ascii=False, indent=4)
             #     print(f"☑️ Extracted {len(characters)} characters from script and saved to {characters_path}.")
         else:
+            characters = _normalize_model_list(characters, CharacterInScene, "characters")
             _emit_render_progress(progress, "extract_characters", "Using provided characters for render", {"provided": True, "count": len(characters)})
             for character in characters:
                 self.character_portrait_events[character.idx] = asyncio.Event()
@@ -231,7 +275,7 @@ class Script2VideoPipeline:
         )
         _emit_render_progress(progress, "camera_tree_ready", "Camera tree ready", {"camera_count": len(camera_tree)})
 
-        priority_shot_idxs = _collect_priority_shot_idxs(camera_tree)
+        priority_shot_idxs = [camera.parent_cam_idx for camera in camera_tree if camera.parent_cam_idx is not None]
         _emit_render_progress(progress, "frames_start", "Generating frames for cameras", {"camera_count": len(camera_tree), "shot_count": len(shot_descriptions)})
         tasks = [
             self.generate_frames_for_single_camera(
@@ -263,10 +307,12 @@ class Script2VideoPipeline:
         else:
             print(f"🎬 Starting concatenating videos...")
             _emit_render_progress(progress, "concat_start", "Concatenating video clips", {"shot_count": len(shot_descriptions)})
-            concatenate_video_files(
-                [os.path.join(self.working_dir, "shots", f"{shot_description.idx}", "video.mp4") for shot_description in shot_descriptions],
-                final_video_path,
-            )
+            video_clips = [
+                VideoFileClip(os.path.join(self.working_dir, "shots", f"{shot_description.idx}", "video.mp4"))
+                for shot_description in shot_descriptions
+            ]
+            final_video = concatenate_videoclips(video_clips)
+            final_video.write_videofile(final_video_path, codec="libx264", preset="medium")
             print(f"☑️ Concatenated videos, saved to {final_video_path}.")
             _emit_render_progress(progress, "concat_done", "Final video concatenated", {"path": final_video_path})
 
@@ -340,10 +386,6 @@ class Script2VideoPipeline:
                     print(f"☑️ Generated new camera image for shot {first_shot_idx} (not completed), saved to {new_camera_image_path}.")
                     _emit_render_progress(progress, "new_camera_image_done", f"New camera image for shot {first_shot_idx} extracted", {"camera_idx": camera.idx, "shot_idx": first_shot_idx, "path": new_camera_image_path})
 
-                # Offer the new-camera image regardless of whether it was just
-                # generated or already on disk: when this sat in the else branch
-                # above, resumed runs silently dropped the key composition
-                # reference and produced different frames than fresh runs.
                 available_image_path_and_text_pairs.append(
                     (
                         new_camera_image_path,
@@ -559,9 +601,11 @@ class Script2VideoPipeline:
             _pipeline_print(quiet, f"🚀 Loaded {len(camera_tree)} cameras from existing file.")
             return camera_tree
 
+        shot_descriptions = _normalize_model_list(shot_descriptions, ShotDescription, "shot_descriptions")
         cameras = _group_shots_into_cameras(shot_descriptions)
 
         camera_tree = await self.camera_image_generator.construct_camera_tree(cameras=cameras, shot_descs=shot_descriptions)
+        camera_tree = _normalize_model_list(camera_tree, Camera, "camera_tree")
         with open(camera_tree_path, "w", encoding="utf-8") as f:
             json.dump([camera.model_dump() for camera in camera_tree], f, ensure_ascii=False, indent=4)
         _pipeline_print(quiet, f"✅ Constructed camera tree and saved to {camera_tree_path}.")
@@ -635,7 +679,7 @@ class Script2VideoPipeline:
         style: str,
         progress: Callable[[str, str, Dict[str, Any] | None], None] | None = None,
     ):
-        character_dir = os.path.join(self.working_dir, "character_portraits", f"{character.idx}_{safe_path_component(character.identifier_in_scene)}")
+        character_dir = os.path.join(self.working_dir, "character_portraits", f"{character.idx}_{character.identifier_in_scene}")
         os.makedirs(character_dir, exist_ok=True)
         _emit_render_progress(progress, "character_portrait_start", f"Generating portraits for {character.identifier_in_scene}", {"character_idx": character.idx, "identifier": character.identifier_in_scene})
 
@@ -712,6 +756,7 @@ class Script2VideoPipeline:
                 user_requirement=user_requirement,
                 retry_timeout=150,
             )
+            storyboard = _normalize_model_list(storyboard, ShotBriefDescription, "storyboard")
             with open(storyboard_path, 'w', encoding='utf-8') as f:
                 json.dump([shot.model_dump() for shot in storyboard], f, ensure_ascii=False, indent=4)
             _pipeline_print(quiet, f"✅ Designed storyboard and saved to {storyboard_path}.")
@@ -757,6 +802,7 @@ class Script2VideoPipeline:
                 characters=characters,
                 retry_timeout=120,
             )
+            shot_description = _normalize_model_list([shot_description], ShotDescription, "shot_description")[0]
             with open(shot_description_path, 'w', encoding='utf-8') as f:
                 json.dump(shot_description.model_dump(), f, ensure_ascii=False, indent=4)
             _pipeline_print(quiet, f"✅ Decomposed visual description for shot {shot_brief_description.idx} and saved to {shot_description_path}.")
@@ -774,29 +820,3 @@ class Script2VideoPipeline:
             }
 
         return shot_description
-
-
-def _group_shots_into_cameras(shot_descriptions: List[ShotDescription]) -> List[Camera]:
-    """Group shots by their camera index.
-
-    Cameras are looked up by their idx field, not by list position: cameras are
-    appended in order of first appearance, so positional indexing would attach
-    shots to the wrong camera whenever the LLM emits cam indices out of order.
-    """
-    cameras: List[Camera] = []
-    cameras_by_idx: Dict[int, Camera] = {}
-    for shot_description in shot_descriptions:
-        camera = cameras_by_idx.get(shot_description.cam_idx)
-        if camera is None:
-            camera = Camera(idx=shot_description.cam_idx, active_shot_idxs=[shot_description.idx])
-            cameras_by_idx[shot_description.cam_idx] = camera
-            cameras.append(camera)
-        else:
-            camera.active_shot_idxs.append(shot_description.idx)
-    return cameras
-
-
-def _collect_priority_shot_idxs(camera_tree: List[Camera]) -> List[int]:
-    """Shot indices that other cameras depend on (compared against shot idxs, so
-    they must come from parent_shot_idx, not the camera index space)."""
-    return [camera.parent_shot_idx for camera in camera_tree if camera.parent_shot_idx is not None]
