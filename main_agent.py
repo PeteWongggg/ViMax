@@ -20,6 +20,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the ViMax agent loop.")
     parser.add_argument("--session", default="", help="Existing session id to activate before the run starts.")
     parser.add_argument("--new-session", action="store_true", help="Create and activate a new empty session before the run starts.")
+    parser.add_argument("--new-session-name", default="", help="Display name for a newly created session.")
     parser.add_argument("--jsonl", action="store_true", help="Print one JSON event per line.")
     parser.add_argument("--once", default="", help="Run a single prompt and exit. If omitted and stdin is not a TTY, stdin is consumed as one prompt.")
     parser.add_argument("--stdin-repl", action="store_true", help=argparse.SUPPRESS)
@@ -103,11 +104,17 @@ async def amain(argv: list[str] | None = None) -> int:
     if args.session and args.new_session:
         print("error: --session and --new-session cannot be used together", file=sys.stderr)
         return 2
+    if args.new_session_name and not args.new_session:
+        print("error: --new-session-name requires --new-session", file=sys.stderr)
+        return 2
     if args.session or args.new_session:
         try:
             session_index = load_session_index()
             if args.new_session:
-                session_index.create()
+                if args.new_session_name:
+                    session_index.create(project_name=args.new_session_name)
+                else:
+                    session_index.create()
             else:
                 session_index.set_active(args.session)
         except KeyError:

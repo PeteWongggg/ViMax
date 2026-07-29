@@ -1,6 +1,8 @@
 import asyncio
+import json
 import tempfile
 import unittest
+from copy import deepcopy
 
 from agent_runtime.context_compactor import ContextCompactor
 from agent_runtime.llm import AssistantMessage
@@ -17,6 +19,21 @@ class FakeLLM:
         self.replies = list(replies)
 
     async def complete(self, messages, tools):
+        return self.replies.pop(0)
+
+
+class FailingLLM:
+    async def complete(self, messages, tools):
+        raise RuntimeError("provider returned invalid response shape")
+
+
+class CapturingLLM:
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls = []
+
+    async def complete(self, messages, tools):
+        self.calls.append(deepcopy(messages))
         return self.replies.pop(0)
 
 
@@ -103,6 +120,18 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("after compact", loop.history[-1]["content"])
             self.assertNotIn("old request", index.memory_text())
 
+
+    async def test_llm_sampling_error_yields_error_without_crashing_loop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            registry = ToolRegistry([])
+            loop = AgentLoop(index, PromptBuilder(f"{tmp}/prompts", index, registry), registry, ToolExecutor(registry, index), FailingLLM())
+            events = [event async for event in loop.stream_events("start")]
+            self.assertTrue(any(event["type"] == "error" and event.get("metadata", {}).get("error_type") == "llm_sampling_failed" for event in events))
+            self.assertEqual(events[-2]["type"], "done")
+            self.assertEqual(events[-1]["type"], "session")
+            self.assertEqual(index.active()["recent_turn_records"][-1]["status"], "failed")
+
     async def test_tool_call_continues_then_finishes(self):
         with tempfile.TemporaryDirectory() as tmp:
             index = SessionIndex(tmp)
@@ -116,3 +145,34 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             events = [event async for event in loop.stream_events("start")]
             self.assertTrue(any(event["type"] == "tool_result" for event in events))
             self.assertEqual(events[-2]["assistant"], "finished")
+
+    async def test_transient_tool_images_reach_next_llm_turn_but_not_events_or_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            data_url = "data:image/jpeg;base64,ZmFrZS1pbWFnZQ=="
+
+            def view(args):
+                return ToolResult(
+                    "view_image",
+                    True,
+                    "image loaded",
+                    {"path": "idea2video/frame.png"},
+                    model_content=[{"type": "image_url", "image_url": {"url": data_url, "detail": "high"}}],
+                )
+
+            registry = ToolRegistry([ToolSpec("view_image", "View image", view, schema={"path": ToolArgumentSchema(str, True)})])
+            llm = CapturingLLM(
+                [
+                    AssistantMessage(tool_calls=[ToolCall(name="view_image", arguments={"path": "idea2video/frame.png"})]),
+                    AssistantMessage(text="The frame is visible."),
+                ]
+            )
+            loop = AgentLoop(index, PromptBuilder(f"{tmp}/prompts", index, registry), registry, ToolExecutor(registry, index), llm)
+            events = [event async for event in loop.stream_events("inspect the frame")]
+
+            image_messages = [message for message in llm.calls[1] if message.get("role") == "user" and isinstance(message.get("content"), list)]
+            self.assertEqual(len(image_messages), 1)
+            self.assertEqual(image_messages[0]["content"][1]["image_url"]["url"], data_url)
+            self.assertNotIn(data_url, json.dumps(events))
+            self.assertNotIn(data_url, json.dumps(loop.history))
+            self.assertNotIn(data_url, (index.logs_dir / "tool_calls.jsonl").read_text(encoding="utf-8"))

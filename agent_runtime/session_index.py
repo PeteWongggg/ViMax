@@ -100,10 +100,18 @@ class SessionIndex:
         return self._with_session_defaults(record) if isinstance(record, dict) else None
 
     @_synchronized
-    def create(self, idea: str = "", user_requirement: str = "", style: str = "", session_id: str | None = None) -> dict[str, Any]:
+    def create(
+        self,
+        idea: str = "",
+        user_requirement: str = "",
+        style: str = "",
+        session_id: str | None = None,
+        project_name: str = "",
+    ) -> dict[str, Any]:
         data = self.load()
         sessions = data.setdefault("sessions", {})
-        final_id = self._normalize_session_id(session_id) if session_id else self._new_session_id(idea or user_requirement or "vimax", sessions)
+        clean_project_name = str(project_name or "").strip()[:64]
+        final_id = self._normalize_session_id(session_id) if session_id else self._new_session_id(clean_project_name or idea or user_requirement or "vimax", sessions)
         if final_id in sessions:
             final_id = self._dedupe_session_id(final_id, sessions)
         now = datetime.now().isoformat(timespec="seconds")
@@ -112,6 +120,7 @@ class SessionIndex:
         (working_dir / "script2video").mkdir(parents=True, exist_ok=True)
         record = {
             "session_id": final_id,
+            "project_name": clean_project_name,
             "working_dir": str(working_dir.relative_to(self.workspace_root)),
             "idea": idea,
             "user_requirement": user_requirement,
@@ -263,6 +272,7 @@ class SessionIndex:
             "idea2video/scene_*/shots/*/shot_description.json": bool(idea_scene_shot_desc_groups) and all(idea_scene_shot_desc_groups),
             "idea2video/scene_*/shots/*/*_selector_output.json": bool(idea_scene_selector_outputs),
             "idea2video/final_video.mp4": (idea_dir / "final_video.mp4").exists(),
+            "script2video/script.txt": (root / "script2video" / "script.txt").exists(),
             "script2video/characters.json": (root / "script2video" / "characters.json").exists(),
             "script2video/storyboard.json": (root / "script2video" / "storyboard.json").exists(),
             "script2video/shots/*/shot_description.json": bool(script_shot_descs),
@@ -298,6 +308,7 @@ class SessionIndex:
 
     def _with_session_defaults(self, record: dict[str, Any]) -> dict[str, Any]:
         item = dict(record)
+        item.setdefault("project_name", "")
         item.setdefault("compacted_summary", "")
         item.setdefault("compacted_turns", 0)
         item.setdefault("compaction_snapshots", [])
@@ -308,7 +319,7 @@ class SessionIndex:
 
     def _new_session_id(self, source: str, sessions: dict[str, Any]) -> str:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        slug = re.sub(r"[^a-zA-Z0-9]+", "-", source.lower()).strip("-")[:32] or "vimax"
+        slug = (re.sub(r"[^a-zA-Z0-9]+", "-", source.lower()).strip("-")[:32].strip("-") or "vimax")
         return self._dedupe_session_id(f"{stamp}-{slug}", sessions)
 
     def _dedupe_session_id(self, base: str, sessions: dict[str, Any]) -> str:

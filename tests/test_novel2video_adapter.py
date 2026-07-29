@@ -215,6 +215,19 @@ def write_minimal_novel_artifacts(root: Path):
 
 
 class NovelAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_novel_initializes_named_empty_active_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            empty = index.create(project_name="Novel draft")
+            adapter = ViMaxAdapters(Path(tmp), index)
+            with patch("agent_runtime.vimax_adapters._build_novel_pipeline", side_effect=lambda working_dir: FakeNovelPipeline(Path(working_dir))):
+                result = await adapter.vimax_novel_planning({"novel_text": "Hero opens a door."})
+            self.assertTrue(result.ok)
+            payload = json.loads(result.content)
+            self.assertEqual(payload["session_id"], empty["session_id"])
+            self.assertEqual(index.active()["project_name"], "Novel draft")
+            self.assertEqual(len(index.load()["sessions"]), 1)
+
     async def test_missing_rag_config_returns_tool_error_and_marks_session_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             index = SessionIndex(tmp)

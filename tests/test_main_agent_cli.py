@@ -13,14 +13,16 @@ class FakeSessionIndex:
         self.fail_session = fail_session
         self.activated = ""
         self.created = 0
+        self.project_name = ""
 
     def set_active(self, session_id):
         if self.fail_session:
             raise KeyError(session_id)
         self.activated = session_id
 
-    def create(self):
+    def create(self, project_name=""):
         self.created += 1
+        self.project_name = project_name
         self.activated = f"new-{self.created}"
         return {"session_id": self.activated}
 
@@ -127,6 +129,19 @@ class MainAgentCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stderr, "")
         self.assertEqual(session_index.created, 1)
         self.assertEqual(session_index.activated, "new-1")
+        self.assertEqual(runtime.inputs, ["hello"])
+
+    async def test_named_new_session_passes_project_name(self):
+        runtime = FakeRuntime()
+        session_index = FakeSessionIndex()
+        code, stdout, stderr, runtime = await self.run_cli(
+            ["--new-session", "--new-session-name", "Ocean campaign", "--jsonl", "--once", "hello"],
+            runtime=runtime,
+            session_index=session_index,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(session_index.project_name, "Ocean campaign")
         self.assertEqual(runtime.inputs, ["hello"])
 
     async def test_new_session_and_session_are_mutually_exclusive(self):

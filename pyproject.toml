@@ -1,7 +1,7 @@
 [project]
 name = "autolongvideogeneration"
-version = "1.1.0"
-description = "Add your description here"
+version = "1.2.0"
+description = "Agentic video generation with idea, script, novel, TUI, and Web UI workflows"
 readme = "readme.md"
 requires-python = ">=3.12"
 dependencies = [

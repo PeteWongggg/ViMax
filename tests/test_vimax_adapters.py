@@ -56,6 +56,11 @@ class FailRenderIdeaPipeline(FakeIdeaPipeline):
         raise RuntimeError("render failed")
 
 
+class FailRender403IdeaPipeline(FakeIdeaPipeline):
+    async def __call__(self, idea, user_requirement, style, quiet=False):
+        raise RuntimeError("OpenRouter video create failed with HTTP 403: {'error': {'message': 'Key limit exceeded (total limit). Manage it using token sk-short', 'code': 403}}")
+
+
 class NoisyRenderIdeaPipeline(FakeIdeaPipeline):
     async def __call__(self, idea, user_requirement, style, quiet=False):
         print("NOISE_FROM_RENDER_PIPELINE")
@@ -183,6 +188,23 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse((root / "script2video" / "final_video.mp4").exists())
 
 
+    async def test_script_mode_persists_source_script_for_render(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            adapter = ViMaxAdapters(Path(tmp), index)
+            script = "A red ball rolls across a white table."
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", FakeScriptPipeline):
+                result = await adapter.vimax_narrative_planning({"script": script, "user_requirement": "one shot"})
+            self.assertTrue(result.ok)
+            payload = json.loads(result.content)
+            root = Path(tmp) / payload["working_dir"]
+            self.assertEqual((root / "script2video" / "script.txt").read_text(encoding="utf-8"), script)
+            self.assertEqual(index.artifact_checklist(payload["session_id"])["script2video/script.txt"], True)
+            from agent_runtime.vimax_adapters import _load_script_text
+            self.assertEqual(_load_script_text(root), script)
+
+
     async def test_narrative_planning_forwards_pipeline_progress(self):
         with tempfile.TemporaryDirectory() as tmp:
             index = SessionIndex(tmp)
@@ -209,8 +231,10 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", FakeIdeaPipeline), \
                  patch("agent_runtime.vimax_adapters.Script2VideoPipeline", FailingScriptPipeline):
-                with self.assertRaises(RuntimeError):
-                    await adapter.vimax_narrative_planning({"idea": "moon cat"})
+                result = await adapter.vimax_narrative_planning({"idea": "moon cat"})
+            self.assertFalse(result.ok)
+            self.assertEqual(result.metadata["error_type"], "recoverable_planning_step_failed")
+            self.assertTrue(result.metadata["retryable"])
             session = index.active()
             self.assertEqual(session["stage"], "error")
             self.assertIn("storyboard failed", session["summary"])
@@ -223,8 +247,9 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             with patch.dict("os.environ", {"VIMAX_NARRATIVE_STEP_TIMEOUT_SECONDS": "0.01"}), \
                  patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", HangingIdeaPipeline):
-                with self.assertRaises(RuntimeError):
-                    await adapter.vimax_narrative_planning({"idea": "moon cat"})
+                result = await adapter.vimax_narrative_planning({"idea": "moon cat"})
+            self.assertFalse(result.ok)
+            self.assertEqual(result.metadata["error_type"], "recoverable_planning_step_failed")
             session = index.active()
             self.assertIsNotNone(session)
             self.assertEqual(session["stage"], "error")
@@ -265,6 +290,22 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
                 first = await adapter.vimax_narrative_planning({"idea": "moon cat"})
                 second = await adapter.vimax_narrative_planning({"idea": "ocean robot"})
             self.assertNotEqual(json.loads(first.content)["session_id"], json.loads(second.content)["session_id"])
+
+    async def test_new_idea_initializes_named_empty_active_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            empty = index.create(project_name="00")
+            adapter = ViMaxAdapters(Path(tmp), index)
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", FakeIdeaPipeline), \
+                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", FakeScriptPipeline):
+                result = await adapter.vimax_narrative_planning({"idea": "moon cat"})
+            self.assertTrue(result.ok)
+            payload = json.loads(result.content)
+            self.assertEqual(payload["session_id"], empty["session_id"])
+            self.assertEqual(index.active()["project_name"], "00")
+            self.assertEqual(index.active()["idea"], "moon cat")
+            self.assertEqual(len(index.load()["sessions"]), 1)
 
 
     async def test_explicit_session_with_different_idea_creates_new_session(self):
@@ -335,8 +376,10 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             (root / "scene_0" / "shots" / "0" / "shot_description.json").write_text("{}", encoding="utf-8")
             adapter = ViMaxAdapters(Path(tmp), index)
             with patch("agent_runtime.vimax_adapters._build_chat_model", side_effect=RuntimeError("missing key")):
-                with self.assertRaises(RuntimeError):
-                    await adapter.vimax_render_video({})
+                result = await adapter.vimax_render_video({})
+            self.assertFalse(result.ok)
+            self.assertEqual(result.metadata["error_type"], "render_failed")
+            self.assertIn("missing key", result.content)
             self.assertEqual(index.get(record["session_id"])["stage"], "error")
 
     async def test_render_failure_marks_session_error(self):
@@ -356,9 +399,44 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", FailRenderIdeaPipeline):
-                with self.assertRaises(RuntimeError):
-                    await adapter.vimax_render_video({})
+                result = await adapter.vimax_render_video({})
+            self.assertFalse(result.ok)
+            self.assertEqual(result.metadata["error_type"], "render_failed")
+            self.assertIn("render failed", result.content)
             self.assertEqual(index.get(record["session_id"])["stage"], "error")
+            status_path = Path(tmp) / record["working_dir"] / "render_status.json"
+            events_path = Path(tmp) / record["working_dir"] / "render_events.jsonl"
+            self.assertTrue(status_path.exists())
+            self.assertTrue(events_path.exists())
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(status["status"], "error")
+            self.assertEqual(status["error_type"], "render_failed")
+
+    async def test_render_403_key_limit_is_non_retryable_and_sanitized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            record = index.create(idea="x")
+            root = Path(tmp) / record["working_dir"] / "idea2video"
+            (root / "scene_0" / "shots" / "0").mkdir(parents=True, exist_ok=True)
+            (root / "story.txt").write_text("story", encoding="utf-8")
+            (root / "characters.json").write_text("[]", encoding="utf-8")
+            (root / "script.json").write_text("[]", encoding="utf-8")
+            (root / "scene_0" / "storyboard.json").write_text("[]", encoding="utf-8")
+            (root / "scene_0" / "camera_tree.json").write_text("[]", encoding="utf-8")
+            (root / "scene_0" / "shots" / "0" / "shot_description.json").write_text("{}", encoding="utf-8")
+            adapter = ViMaxAdapters(Path(tmp), index)
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", FailRender403IdeaPipeline):
+                result = await adapter.vimax_render_video({})
+            self.assertFalse(result.ok)
+            self.assertFalse(result.metadata["retryable"])
+            self.assertIn("<redacted>", result.metadata["error"])
+            self.assertNotIn("sk-short", result.metadata["error"])
+            status = json.loads((Path(tmp) / record["working_dir"] / "render_status.json").read_text(encoding="utf-8"))
+            self.assertFalse(status["retryable"])
+            self.assertNotIn("sk-short", status["error"])
 
 
     async def test_render_pipeline_stdout_is_suppressed(self):
